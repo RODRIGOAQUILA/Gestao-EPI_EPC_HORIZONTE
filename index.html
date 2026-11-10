@@ -428,34 +428,67 @@ function saveItemsExplicitly(){
 }
 function importItemsExcel(){
  openFile(file=>{
-  if(!window.XLSX){alert('Importação Excel requer a biblioteca XLSX. Verifique a conexão.');return}
-  const reader=new FileReader();reader.onerror=()=>alert('Falha na leitura.');reader.onload=()=>{
+  if(!window.XLSX){alert('A biblioteca XLSX não está disponível.');return}
+  const reader=new FileReader();reader.onerror=()=>alert('Falha na leitura do Excel.');reader.onload=()=>{
    try{
-    const wb=XLSX.read(reader.result,{type:'array'}),sheet=wb.Sheets[wb.SheetNames.find(n=>n.toUpperCase().includes('ITENS'))||wb.SheetNames[0]];
+    const wb=XLSX.read(reader.result,{type:'array'});
+    const sheet=wb.Sheets[wb.SheetNames.find(n=>n.toUpperCase().includes('ITENS'))||wb.SheetNames[0]];
     const rows=XLSX.utils.sheet_to_json(sheet,{defval:null,raw:true});
-    const norm=x=>String(x||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toUpperCase().trim().replace(/\s+/g,' ');
+    const norm=x=>String(x??'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toUpperCase().trim().replace(/\s+/g,' ');
     const get=(r,...keys)=>{const key=Object.keys(r).find(k=>keys.some(t=>norm(k)===norm(t)));return key===undefined?null:r[key]};
-    const number=(v)=>{if(typeof v==='number')return v;let t=String(v).trim().replace(/R\$/g,'').replace(/\s/g,'');if(t.includes(','))t=t.replace(/\./g,'').replace(',','.');return Number(t)};
-    const changes=[],errors=[],missing=[];
+    const number=v=>{if(typeof v==='number')return v;let t=String(v).trim().replace(/R\$/gi,'').replace(/\s/g,'');if(t.includes(','))t=t.replace(/\./g,'').replace(',','.');return Number(t)};
+    const valid=(v,label,line,errors)=>{const n=number(v);if(!Number.isFinite(n)||n<0){errors.push(`Linha ${line}: ${label} inválido`);return null}return n};
+    const planned=[],errors=[],skipped=[],used=new Set();
     rows.forEach((r,ix)=>{
-     const sap=get(r,'SAP','COD MAT','CODIGO SAP'),desc=get(r,'DESCRIÇÃO','DESCRICAO');
-     if(sap===null&&desc===null)return;
+     const line=ix+2,sapRaw=get(r,'SAP','COD MAT','CODIGO SAP'),descRaw=get(r,'DESCRIÇÃO','DESCRICAO');
+     if((sapRaw===null||String(sapRaw).trim()==='')&&(descRaw===null||String(descRaw).trim()===''))return;
+     const sap=String(sapRaw??'').trim(),desc=String(descRaw??'').trim();
+     if(!sap||!desc){errors.push(`Linha ${line}: SAP e descrição são obrigatórios`);return}
      let matches=state.items.filter(i=>norm(i.sap)===norm(sap));
      if(matches.length>1)matches=matches.filter(i=>norm(i.desc)===norm(desc));
-     if(matches.length!==1){missing.push(`linha ${ix+2}: ${sap||''} ${desc||''}`);return}
-     const patch={};
+     // Código DIVERSOS com sufixo: identifica exclusivamente pela descrição.
+     if(matches.length===0&&norm(sap).startsWith('DIVERSOS'))matches=state.items.filter(i=>norm(i.desc)===norm(desc));
+     if(matches.length>1){errors.push(`Linha ${line}: correspondência ambígua para ${sap} — ${desc}`);return}
+     const item=matches[0]||null;
+     const key=item?'ID:'+item.id:'NOVO:'+norm(sap)+'|'+norm(desc);
+     if(used.has(key)){errors.push(`Linha ${line}: material repetido na planilha (${sap} — ${desc})`);return}used.add(key);
+     const patch={};let invalid=false;
      for(const [prop,heads] of [['price',['PREÇO','PRECO','PREÇO R$','PRECO R$']],['life',['VIDA REF','VIDA REF.','VIDA REF (MESES)']],['stock',['ESTOQUE']]]){
-      const v=get(r,...heads);if(v!==null&&String(v).trim()!==''){const n=number(v);if(!Number.isFinite(n)||n<0){errors.push(`linha ${ix+2}: ${prop} inválido`);return}patch[prop]=n}
+      const v=get(r,...heads);if(v!==null&&String(v).trim()!==''){const n=valid(v,prop,line,errors);if(n===null)invalid=true;else patch[prop]=n}
      }
-     const kind=get(r,'TIPO');if(kind!==null&&String(kind).trim()!==''){if(!['EPI','EPC','FERR'].includes(norm(kind))){errors.push(`linha ${ix+2}: TIPO inválido`);return}patch.kind=norm(kind)}
-     const lives={},uses={};TYPES.forEach((t,k)=>{const life=get(r,'VIDA '+t);if(life!==null&&String(life).trim()!==''){const n=number(life);if(!Number.isFinite(n)||n<0){errors.push(`linha ${ix+2}: VIDA ${t} inválida`)}else lives[k]=n}const use=get(r,'USA '+t);if(use!==null&&String(use).trim()!==''){if(!['OK','SIM','NAO','NÃO','-','0','1'].includes(norm(use)))errors.push(`linha ${ix+2}: USA ${t} inválido`);else uses[k]=['OK','SIM','1'].includes(norm(use))}});
-     changes.push({item:matches[0],patch,lives,uses});
+     const kind=get(r,'TIPO');if(kind!==null&&String(kind).trim()!==''){
+      if(!['EPI','EPC','FERR'].includes(norm(kind))){errors.push(`Linha ${line}: TIPO inválido`);invalid=true}else patch.kind=norm(kind)
+     }
+     const lives={},uses={};TYPES.forEach((t,k)=>{
+      const life=get(r,'VIDA '+t);if(life!==null&&String(life).trim()!==''){const n=valid(life,'VIDA '+t,line,errors);if(n===null)invalid=true;else lives[k]=n}
+      const use=get(r,'USA '+t);if(use!==null&&String(use).trim()!==''){
+       if(!['OK','SIM','NAO','NÃO','-','0','1'].includes(norm(use))){errors.push(`Linha ${line}: USA ${t} inválido`);invalid=true}
+       else uses[k]=['OK','SIM','1'].includes(norm(use))
+      }
+     });
+     if(!invalid)planned.push({item,sap,desc,patch,lives,uses,line});
     });
-    if(errors.length){alert('Importação cancelada. Corrija os erros:\n'+errors.slice(0,15).join('\n'));return}
-    if(!changes.length){alert('Nenhum item existente identificado. Confira SAP e, para códigos repetidos como DIVERSOS, DESCRIÇÃO.');return}
-    if(!confirm(`Atualizar ${changes.length} itens existentes?\n${missing.length} linhas não correspondentes serão ignoradas.\nCampos vazios serão preservados. O estoque só muda se a coluna ESTOQUE estiver preenchida.\nFaça backup antes de continuar.`))return;
-    changes.forEach(({item,patch,lives,uses})=>{Object.assign(item,patch);Object.entries(lives).forEach(([k,v])=>item.lives[k]=v);Object.entries(uses).forEach(([k,v])=>item.uses[k]=v)});
-    state.audit.unshift({date:new Date().toLocaleString('pt-BR'),action:`Importação em massa: ${changes.length} itens atualizados`});save();notify(`${changes.length} itens atualizados. ${missing.length} linhas não encontradas.`);
+    if(errors.length){alert('Importação cancelada sem alterar os dados. Corrija:\n'+errors.slice(0,25).join('\n')+(errors.length>25?`\n... e mais ${errors.length-25} erros`:''));return}
+    const updated=planned.filter(x=>x.item),created=planned.filter(x=>!x.item);
+    if(!planned.length){alert('Nenhum material válido encontrado.');return}
+    if(!confirm(`Prévia da importação — ${file.name}\nLinhas válidas: ${planned.length}\nAtualizações: ${updated.length}\nNovos cadastros: ${created.length}\nIgnorados: ${skipped.length}\n\nCampos vazios de itens existentes serão preservados. Novos itens terão campos não informados zerados, USA desmarcado e descontos zerados.\n\nRecomendamos exportar o Backup JSON antes de confirmar. Continuar?`))return;
+    const snapshot=JSON.stringify(state.items);
+    try{
+     let nextId=Math.max(0,...state.items.map(i=>Number(i.id)||0),Date.now());
+     planned.forEach(({item,sap,desc,patch,lives,uses})=>{
+      if(!item){item={id:++nextId,sap,desc,kind:'EPI',life:12,price:0,stock:0,lives:TYPES.map(()=>12),uses:TYPES.map(()=>false),discounts:[0,0,0,0,0]};state.items.push(item)}
+      Object.assign(item,patch);
+      if(!Array.isArray(item.lives))item.lives=TYPES.map(()=>item.life||12);
+      if(!Array.isArray(item.uses))item.uses=TYPES.map(()=>false);
+      Object.entries(lives).forEach(([k,v])=>item.lives[k]=v);
+      Object.entries(uses).forEach(([k,v])=>item.uses[k]=v);
+     });
+     state.audit.unshift({date:new Date().toLocaleString('pt-BR'),action:`Excel Itens e Regras: ${updated.length} atualizados, ${created.length} cadastrados, ${skipped.length} ignorados`});
+     save();
+     const report=`RELATÓRIO DE IMPORTAÇÃO — ITENS E REGRAS\nArquivo: ${file.name}\nAtualizados: ${updated.length}\nNovos: ${created.length}\nIgnorados: ${skipped.length}\nTotal de materiais após importação: ${state.items.length}\n\nNOVOS CADASTROS:\n${created.map(x=>`Linha ${x.line}: ${x.sap} — ${x.desc}`).join('\n')||'Nenhum'}\n\nATUALIZADOS:\n${updated.map(x=>`Linha ${x.line}: ${x.sap} — ${x.desc}`).join('\n')||'Nenhum'}`;
+     const blob=new Blob([report],{type:'text/plain;charset=utf-8'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='relatorio_importacao_itens.txt';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),30000);
+     alert(`Importação concluída!\n${updated.length} atualizados\n${created.length} novos\n${skipped.length} ignorados\nTotal no cadastro: ${state.items.length}\nRelatório baixado.`);
+    }catch(e){state.items=JSON.parse(snapshot);alert('Erro ao aplicar a importação: '+e.message+'\nOs itens em memória foram restaurados.');}
    }catch(e){alert('Não foi possível importar: '+e.message)}
   };reader.readAsArrayBuffer(file);
  });
